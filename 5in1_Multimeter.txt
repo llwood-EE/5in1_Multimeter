@@ -1,0 +1,735 @@
+#include <Adafruit_ADS1X15.h>
+#include <Wire.h>
+#include <BLEDevice.h>
+#include <BLEUtils.h>
+#include <BLEServer.h>
+#include <ADS1115_WE.h>
+#include <driver/pcnt.h>
+#include <driver/ledc.h>
+#include "hal/cpu_hal.h"
+#include "esp_pm.h"
+
+//LCD
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 32  // Or 64 depending on your version
+
+#define OLED_RESET    -1  // Reset pin not used on I2C
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+//LCD
+
+#ifndef IRAM_ATTR
+#define IRAM_ATTR
+#endif
+
+#define I2C_ADDRESS_1 0x48  // First ADS1115 ground
+#define I2C_ADDRESS_2 0x49  // Second ADS1115 5v
+
+#define DISCHARGE 26
+#define CHARGE_1K 33
+#define CHARGE_1M 25
+#define pwmToggle 12
+
+
+float current;
+float voltage;
+float resistance;
+float NodeVoltage;
+
+double frequency, capacitance, inductance;
+
+float startTime, elapsedTime, nowTime, startTimeL, endTime;
+float farad, cycleTime = 4.16667E-3;
+int selectedResistor, currentCycleCount, lastPollTime = 0, pollInterval = 1000;
+
+
+unsigned long measurementWindow = 1890;
+const int pwmPin = 27;
+const int pwmChannel = 0;
+const int pwmResolution = 8;
+const int pwmFrequency = 500;
+
+const int pulsePin = 13;
+const int pcntFilter = 100;
+
+
+const float V_SUPPLY = 3.3;
+const float V_TARGET = 0.632 * V_SUPPLY;
+constexpr int READY_PIN = 32;
+
+//APP CONNECTION
+class MyServerCallbacks: public BLEServerCallbacks {
+  void onConnect(BLEServer* pServer) {
+    Serial.println("BLE Device Connected");
+  }
+
+  void onDisconnect(BLEServer* pServer) {
+    Serial.println("BLE Device Disconnected");
+    BLEDevice::startAdvertising(); // Restart advertising so it can reconnect
+  }
+};
+
+volatile bool new_data = false;
+void IRAM_ATTR NewDataReadyISR() 
+{
+  new_data = true;
+}
+
+float average(ADS1115_MUX PORTS){
+    float sum = 0.0;
+    for (int i = 0; i< 120; i++){
+      sum+=readChannel(PORTS);
+    }
+    return sum/120;
+}
+
+//Adafruit_ADS1115 ads1;  // For current measurement
+Adafruit_ADS1115 ads2;  // For voltage measurement
+ADS1115_WE adc1 = ADS1115_WE(I2C_ADDRESS_1);
+
+#define SERVICE_UUID        "301d6bc8-d06b-44eb-9fd9-e868bfd64e76"
+#define CHARACTERISTIC_UUID "14463a0c-d48b-4c12-b0cf-d44af8f57131"
+
+BLECharacteristic *pCharacteristic;
+
+void setup() {
+  //LCD
+  if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {  // 0x3C is common I2C addr
+    Serial.println(F("SSD1306 allocation failed"));
+    for(;;); // Don’t proceed, loop forever
+  }
+
+  display.clearDisplay();
+  display.setTextSize(2);             // Normal 1:1 pixel scale
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 1);
+  display.println(" ELEC HUB");
+  display.display();
+  delay(1000);
+  //LCD end 
+
+  Wire.begin();
+  Serial.begin(115200);
+
+  pinMode(4, INPUT);
+  pinMode(5, INPUT);
+  pinMode(16, INPUT);
+  pinMode(17, INPUT); //resistance - 6:0-1k, 7:1k-100k, 8:110k-500k, 9:500k-1M
+  pinMode(18, INPUT);
+  pinMode(CHARGE_1K, INPUT);
+  pinMode(CHARGE_1M, INPUT);
+  pinMode(pwmToggle, INPUT);
+  
+  pinMode(DISCHARGE, INPUT);
+  pinMode(READY_PIN, INPUT);
+  pinMode(pulsePin, INPUT);
+
+  if (!adc1.init()) {
+    Serial.println("ADS1115 #1 not connected!");
+  }
+
+  if (!ads2.begin(I2C_ADDRESS_2)) {
+    Serial.println("Failed to initialize ADS1115 #2");
+  }
+
+  Serial.println("Starting BLE...");
+  BLEDevice::init("EHub");
+  BLEServer *pServer = BLEDevice::createServer();
+  BLEService *pService = pServer->createService(SERVICE_UUID);
+
+  pServer->setCallbacks(new MyServerCallbacks());
+
+  pCharacteristic = pService->createCharacteristic(
+                      CHARACTERISTIC_UUID,
+                      BLECharacteristic::PROPERTY_READ |
+                      BLECharacteristic::PROPERTY_NOTIFY
+  );
+
+  pCharacteristic->setValue("Waiting for ADC data...");
+
+  delay(500);
+
+  pService->start();
+
+  BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
+  pAdvertising->addServiceUUID(SERVICE_UUID);
+  pAdvertising->setScanResponse(true);
+  pAdvertising->setMinPreferred(0x06);
+  pAdvertising->setMinPreferred(0x12);
+  BLEDevice::startAdvertising();
+
+  Serial.println("BLE Ready, Sending Data...");
+
+  attachInterrupt(digitalPinToInterrupt(READY_PIN), NewDataReadyISR, FALLING);
+  ads2.setDataRate(RATE_ADS1115_860SPS);
+
+  pcnt_config_t pcntConfig = {};
+  pcntConfig.pulse_gpio_num = pulsePin;
+  pcntConfig.ctrl_gpio_num = pwmPin;
+  pcntConfig.channel = PCNT_CHANNEL_0;
+  pcntConfig.unit = PCNT_UNIT_0;
+  pcntConfig.pos_mode = PCNT_COUNT_INC;
+  pcntConfig.neg_mode = PCNT_COUNT_INC;
+  pcntConfig.lctrl_mode = PCNT_MODE_KEEP;
+  pcntConfig.hctrl_mode = PCNT_MODE_DISABLE;
+  pcntConfig.counter_h_lim = 9513;
+  pcntConfig.counter_l_lim = 0;
+
+  pcnt_unit_config(&pcntConfig);
+  pcnt_set_filter_value(PCNT_UNIT_0, pcntFilter);
+  pcnt_filter_enable(PCNT_UNIT_0);
+
+  ledc_timer_config_t ledc_timer = {
+    .speed_mode = LEDC_HIGH_SPEED_MODE,
+    .duty_resolution = LEDC_TIMER_8_BIT,
+    .timer_num = LEDC_TIMER_0,
+    .freq_hz = pwmFrequency,
+    .clk_cfg = LEDC_AUTO_CLK
+  };
+
+  ledc_timer_config(&ledc_timer);
+
+  ledc_channel_config_t ledc_channel = {
+    .gpio_num = pwmPin,
+    .speed_mode = LEDC_HIGH_SPEED_MODE,
+    .channel = (ledc_channel_t)pwmChannel,
+    .intr_type = LEDC_INTR_DISABLE,
+    .timer_sel = LEDC_TIMER_0,
+    .duty = 14,
+    .hpoint = 0
+  };
+
+  pcnt_counter_pause(PCNT_UNIT_0);
+  pcnt_counter_clear(PCNT_UNIT_0);
+  ledc_channel_config(&ledc_channel);
+}
+
+
+
+
+
+//LOOP!!!!!!!!!!!
+void loop() {
+
+  /*LCD
+  display.clearDisplay();
+  display.setCursor(0, 10);
+  display.print(voltage, 3);
+  display.println(" V");
+  display.display();
+  */
+
+
+  int gpioCurrent = digitalRead(4);
+  int gpioResistance = digitalRead(17);
+  int gpioVoltage = digitalRead(16);
+  int gpioCapacitance = digitalRead(5);
+  int gpioInductance = digitalRead(18);
+
+  String dataStr = "E";
+
+  if (gpioVoltage == HIGH && gpioResistance == HIGH) {
+
+    adc1.setVoltageRange_mV(ADS1115_RANGE_6144);
+    adc1.setConvRate(ADS1115_128_SPS);
+    adc1.setMeasureMode(ADS1115_CONTINUOUS);
+    adc1.setCompareChannels(ADS1115_COMP_0_1);
+    float voltage = readChannel(ADS1115_COMP_0_1)/1000;
+
+    //display
+    if(abs(voltage) >= 1){
+      Serial.print("Voltage: ");
+      Serial.print(voltage);
+      Serial.println(" V");
+      dataStr = String(voltage, 2) + " V";
+
+      //LCD
+      display.clearDisplay();
+      display.setCursor(0, 10);
+      display.print(voltage, 2);
+      display.println(" V");
+      display.display();
+    }
+    else if(abs(voltage) <= 1){
+      Serial.print("Voltage: ");
+      Serial.print(voltage);
+      Serial.println(" mV");
+      dataStr = String(voltage*1000, 0) + " mV";
+
+      //LCD
+      display.clearDisplay();
+      display.setCursor(0, 10);
+      display.print(voltage*1000, 0);
+      display.println(" mV");
+      display.display();
+    }
+    
+  }
+  //RESISTANCE !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+  else if (gpioResistance == LOW) {
+    ads2.setGain(GAIN_ONE);
+    ads2.setDataRate(RATE_ADS1115_128SPS);  // 128 samples per second
+    ads2.startADCReading(ADS1X15_REG_CONFIG_MUX_SINGLE_3, true);
+    Serial.print(" Node voltage:");
+    NodeVoltage = (ads2.computeVolts(ads2.getLastConversionResults()));
+    Serial.print(NodeVoltage,4);
+
+    if((1.2 <= NodeVoltage) && (NodeVoltage <= 1.4)){
+      //code for 1-1k
+
+      Serial.print("  0 Channel  ");
+
+      ads2.startADCReading(ADS1X15_REG_CONFIG_MUX_DIFF_0_1, true);
+      resistance = (ads2.computeVolts(ads2.getLastConversionResults())) / 0.00178;
+      
+
+      //checks for correct resistance 
+      if( (resistance >= 1) && (resistance <= 1010) ){
+        Serial.print("Resistance: ");
+        Serial.print(resistance);
+        Serial.println(" Ohms");
+        dataStr = String(resistance, 1) + " Ω"; // for app
+
+        display.clearDisplay();
+        display.setCursor(0, 10);
+        display.print(resistance, 2);
+        display.println(" Ohms");
+        display.display();
+      }
+      else{
+        Serial.println("0ERROR");
+
+        display.clearDisplay();
+        display.setCursor(0, 10);
+        display.print("0ERROR");
+        display.display();
+        dataStr = "0ERROR"; // for app
+      }
+      //end
+    }
+    else if((1.0 <= NodeVoltage) && (NodeVoltage <= 1.1)){
+      //code 1k -100k
+
+      Serial.print("  1 Channel  ");
+
+      ads2.startADCReading(ADS1X15_REG_CONFIG_MUX_DIFF_0_1, true);
+      resistance = (ads2.computeVolts(ads2.getLastConversionResults())) / 0.0000236;
+
+      //checks for correct resistance 
+      if( (resistance >1010) && (resistance <= 100100) ){
+        Serial.print("Resistance: ");
+        Serial.print(resistance/1000);
+        Serial.println(" Kohms");
+        dataStr = String(resistance/1000, 2) + " kΩ"; // for app
+
+        display.clearDisplay();
+        display.setCursor(0, 10);
+        display.print(resistance, 0);
+        display.println(" Ohms");
+        display.display();
+      }
+      else{
+        Serial.println("1ERROR");
+
+        display.clearDisplay();
+        display.setCursor(0, 10);
+        display.print("1ERROR");
+        display.display();
+        dataStr = "1ERROR"; // for app
+      }
+      //end
+    }
+    else if((0.945 <= NodeVoltage) && (NodeVoltage <= 1.0)){
+      //code 100k-500k
+
+      Serial.print("  2 Channel  ");
+
+      ads2.startADCReading(ADS1X15_REG_CONFIG_MUX_DIFF_0_1, true);
+      resistance = (ads2.computeVolts(ads2.getLastConversionResults())) / 0.00000479;
+
+      //checks for correct resistance 
+      if( (resistance > 100100) && (resistance <= 501000) ){
+        Serial.print("Resistance: ");
+        Serial.print(resistance);
+        Serial.println(" ohms");
+
+        display.clearDisplay();
+        display.setCursor(0, 10);
+        display.print(resistance/1000, 0);
+        display.println(" KOhms");
+        display.display();
+        dataStr = String(resistance/1000, 0) + " kΩ"; // for app
+        
+      }
+      else{
+        Serial.println("2ERROR");
+
+        display.clearDisplay();
+        display.setCursor(0, 10);
+        display.print("2ERROR");
+        display.display();
+        dataStr = "2ERROR"; // for app
+      }
+      //end
+    }
+    else if((NodeVoltage < 0.945)){
+      //code for 500k - 1M
+
+      Serial.print("  3 Channel  ");
+
+      ads2.startADCReading(ADS1X15_REG_CONFIG_MUX_DIFF_0_1, true);
+      resistance = (ads2.computeVolts(ads2.getLastConversionResults())) / 0.0000025;
+
+      //checks for correct resistance 
+      if((resistance > 500500) && (resistance <= 1050000)){
+        Serial.print("Resistance: ");
+        Serial.print(resistance);
+        Serial.println(" ohms");
+
+        display.clearDisplay();
+        display.setCursor(0, 10);
+        display.print(resistance/1000, 0);
+        display.println(" KOhms");
+        display.display();
+        dataStr = String(resistance/1000, 1) + " kΩ"; // for app
+      }
+      else{
+        Serial.println("3ERROR");
+
+        display.clearDisplay();
+        display.setCursor(0, 10);
+        display.print("3ERROR");
+        display.display();
+        dataStr = "3ERROR"; // for app
+      }
+      //end
+    }
+  }
+
+  //CURRENT 
+  else if (gpioCurrent == HIGH && gpioResistance == HIGH) {
+  
+    adc1.setAutoRange();
+    adc1.setConvRate(ADS1115_32_SPS);
+    adc1.setMeasureMode(ADS1115_CONTINUOUS);
+    adc1.setCompareChannels(ADS1115_COMP_2_3);
+    float voltageDrop = readChannel(ADS1115_COMP_2_3);
+    float shunt_resistance = 0.451;
+    current = (voltageDrop / shunt_resistance);
+
+    if (abs(current) >= 1){
+      Serial.print("Current: ");
+      Serial.print(current);
+      Serial.println(" mA");
+      dataStr = String(current, 2) + " mA";
+
+      //LCD 
+      display.clearDisplay();
+      display.setCursor(0, 10);
+      display.print(current, 2);
+      display.println(" mA");
+      display.display();
+    }
+    else if(abs(current) < 1){
+      Serial.print("Current: ");
+      Serial.print(current);
+      Serial.println(" uA");
+      dataStr = String(current*100, 1) + " uA";
+
+      //LCD 
+      display.clearDisplay();
+      display.setCursor(0, 10);
+      display.print(current, 2);
+      display.println(" mA");
+      display.display();
+    }
+
+  } 
+  
+  else if (gpioCapacitance == HIGH && gpioResistance == HIGH) {
+    ads2.setDataRate(RATE_ADS1115_860SPS);
+    ads2.setGain(GAIN_TWOTHIRDS);
+    ads2.startADCReading(ADS1X15_REG_CONFIG_MUX_SINGLE_2, true);
+    
+    new_data = false;
+    lastPollTime = 0;    
+
+    pinMode(CHARGE_1K, OUTPUT);
+    delay(500);
+    digitalWrite(CHARGE_1K, HIGH);
+
+    selectedResistor = 1000;
+    startTime = cpu_hal_get_cycle_count()*cycleTime;
+
+  while(cpu_hal_get_cycle_count()*cycleTime - startTime <= 1000000){
+    currentCycleCount = cpu_hal_get_cycle_count();
+    
+    if(new_data && (currentCycleCount - lastPollTime) >= pollInterval) {
+      lastPollTime = currentCycleCount;
+      int adcValue = ads2.getLastConversionResults();
+      new_data = false;
+      
+      if (adcValue >= 11123){
+        nowTime = cpu_hal_get_cycle_count()*cycleTime;
+        elapsedTime = (nowTime - startTime - 800);
+        Serial.println(elapsedTime);
+        break;
+    }
+  }
+}
+  
+if (elapsedTime < 0){
+  elapsedTime = 0;
+}
+
+  Serial.print("t1 = ");
+  Serial.print(elapsedTime);       
+  Serial.println(" us ");
+
+  farad = ((float)elapsedTime/1000000) / 1000 * 1.05;
+
+  digitalWrite(CHARGE_1K, LOW);
+  pinMode(CHARGE_1K, INPUT);
+
+  pinMode(DISCHARGE, OUTPUT);
+  digitalWrite(DISCHARGE, LOW);
+
+  while (ads2.getLastConversionResults() > 100) {
+  }
+  delay(500);
+  pinMode(DISCHARGE, INPUT);
+  
+  if (elapsedTime > 999)
+  {
+    Serial.print("C1: ");
+    Serial.print(farad*(1E6), 2);       
+    Serial.println(" uF ");
+    dataStr = String(farad*(1E6), 2) + "uF";
+
+    //LCD
+    display.clearDisplay();
+    display.setCursor(0, 10);
+    display.print(farad*(1E6), 2);
+    display.println(" uF");
+    display.display();
+
+    elapsedTime = 0;
+    delay(500);        
+  }
+  else 
+  {
+    selectedResistor = 10000000;     
+    pinMode(CHARGE_1M, OUTPUT); 
+    digitalWrite(CHARGE_1M, HIGH); // Corrected this line
+
+  startTime = cpu_hal_get_cycle_count()*cycleTime;
+  
+  while(cpu_hal_get_cycle_count()*cycleTime - startTime <= 1000000){
+    currentCycleCount = cpu_hal_get_cycle_count();
+    
+    if(new_data && (currentCycleCount - lastPollTime) >= pollInterval) {
+      lastPollTime = currentCycleCount;
+      int adcValue = ads2.getLastConversionResults();
+      new_data = false;
+      
+      if (adcValue >= 11123){
+        nowTime = cpu_hal_get_cycle_count()*cycleTime;
+        elapsedTime = (nowTime - startTime - 1000);
+        Serial.println(elapsedTime);
+        break;
+    }
+  }
+}
+    if (elapsedTime < 0){
+      elapsedTime = 0;
+    }
+    Serial.print("t2 = ");
+    Serial.print(elapsedTime);       
+    Serial.println(" us ");
+
+    farad = ((float)elapsedTime/1000000) / 1000000;
+
+    digitalWrite(CHARGE_1M, LOW);
+    pinMode(CHARGE_1M, INPUT);
+
+    pinMode(DISCHARGE, OUTPUT);
+    digitalWrite(DISCHARGE, LOW);
+
+    while (ads2.getLastConversionResults() > 100) {
+    }
+    
+    pinMode(DISCHARGE, INPUT);
+    
+    if (elapsedTime > 999)
+    {
+      Serial.print("C2: ");
+      Serial.print(farad*(1E9), 2);
+      Serial.println(" nF");
+      dataStr = String(farad*(1E9), 2) + "nF";
+      elapsedTime = 0;
+      delay(500);
+
+      //LCD
+      display.clearDisplay();
+      display.setCursor(0, 10);
+      display.print(farad*(1E9), 2);
+      display.println(" nF");
+      display.display();
+    }
+    else
+    {
+     Serial.println("Capacitance out of range!!");
+     dataStr = "Capacitance out of of range!!";
+
+     //LCD
+      display.clearDisplay();
+      display.setCursor(0, 10);
+      display.print("C O.O.R.");
+      display.display();
+
+    }
+  }
+}
+
+
+  //INDUCTANCE 
+  else if (gpioInductance == HIGH && gpioResistance == HIGH){
+      pcnt_counter_pause(PCNT_UNIT_0);
+      pcnt_counter_clear(PCNT_UNIT_0);
+      int16_t pulseCount = 0;
+
+  // Wait for the start of a high pulse
+    while (digitalRead(pwmToggle) == LOW) {
+      yield();
+    }
+
+    // Wait for the transition from high to low (start of low period)
+    while (digitalRead(pwmToggle) == HIGH) {
+      yield();
+    }
+
+    // Now we are at the beginning of the low period
+    startTimeL = esp_timer_get_time();
+    pcnt_counter_resume(PCNT_UNIT_0);
+
+    // Measure the entire low portion of the PWM signal
+    while (digitalRead(pwmToggle) == LOW) {
+      yield();
+    }
+
+    pcnt_counter_pause(PCNT_UNIT_0);
+    endTime = esp_timer_get_time();
+
+    measurementWindow = endTime - startTimeL;
+    Serial.print("MeasurementWindow:");
+    Serial.println(measurementWindow);
+    
+    //LCD
+    display.clearDisplay();
+    display.setCursor(0, 10);
+    display.print("Inductance");
+    display.display();
+    delay(500);
+    
+    pcnt_get_counter_value(PCNT_UNIT_0, &pulseCount);
+
+    if (pulseCount <= 10) {
+      frequency = ((pulseCount) / (measurementWindow / 1000000.0))/(1.96);
+    }
+    else if (pulseCount <= 20){
+      frequency = ((pulseCount) / (measurementWindow / 1000000.0))/(2);
+    }
+    else {
+      frequency = ((pulseCount) / (measurementWindow / 1000000.0))/(2);
+    }
+
+
+    Serial.print("Count:");
+    Serial.println(pulseCount);
+    delay(500);
+
+    if (frequency > 500) {
+      capacitance = 1.0E-6;
+      inductance = 1.0 / (capacitance * frequency * frequency * 4.0 * 3.14159 * 3.14159);
+
+      Serial.print("Frequency Hz: ");
+      Serial.print(frequency);
+      Serial.print("\tInductance: ");
+
+      if (inductance > 1.0E-3) {
+        Serial.print(inductance * 1000.0);
+        Serial.println(" mH");
+        dataStr = String(inductance*(1000), 2) + " mH" ;
+
+        //LCD
+        display.clearDisplay();
+        display.setCursor(0, 10);
+        display.print(inductance*(1000), 2);
+        display.println(" mH");
+        display.display(); 
+      } 
+      else if (inductance < 1.0E-3 && inductance > 0.1E-6){
+        Serial.print(inductance * 1000000);
+        Serial.println(" uH");
+        dataStr = String(inductance*(1E6), 2) + " uH";
+
+        //LCD
+        display.clearDisplay();
+        display.setCursor(0, 10);
+        display.print(inductance*(1E6), 2);
+        display.println(" uH");
+        display.display();  
+      }
+      else if (inductance < 1.0E-6 && inductance > 0.1E-9) {
+        Serial.print(inductance * 1000000000);
+        Serial.println(" nH");
+        dataStr = String(inductance*(1E9), 2) + " nH";
+
+        //LCD
+        display.clearDisplay();
+        display.setCursor(0, 10);
+        display.print(inductance*(1E9), 2);
+        display.println(" nH");
+        display.display();
+      }
+      else {
+        Serial.println("Inductance out of range!");
+        dataStr = "Inductance out of range!";
+
+        //LCD
+        display.clearDisplay();
+        display.setCursor(0, 10);
+        display.print("Inductance");
+        display.display();
+      }
+    }
+  }    
+
+
+  
+  else{
+    Serial.println("No reading!!");
+    dataStr = "No reading!!";
+
+    //LCD
+    display.clearDisplay();
+    display.setCursor(0, 10);
+    display.print("No Reading");
+    display.display();
+
+  }
+
+  pCharacteristic->setValue(dataStr.c_str());
+  pCharacteristic->notify();
+  delay(1000);
+}
+
+
+float readChannel(ADS1115_MUX channel) {
+  float voltage = 0.0;
+  adc1.setCompareChannels(channel);
+  voltage = adc1.getResult_mV();
+  return voltage;
+}
